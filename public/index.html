@@ -1,0 +1,172 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#090914">
+  <title>Beat Sync — Listen Together</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+
+  <header class="topbar">
+    <a class="brand" href="/">
+      <span class="brand-icon">♫</span>
+      <span>beat<span class="brand-accent">sync</span></span>
+    </a>
+    <div class="live-indicator">
+      <span class="live-dot"></span>
+      <span id="connectionStatus">Connecting</span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="hero">
+      <div class="eyebrow">
+        <span class="eyebrow-line"></span>
+        MUSIC SOUNDS BETTER TOGETHER
+      </div>
+
+      <h1>One song.<br><span>Everywhere.</span></h1>
+      <p class="hero-copy">
+        Create a room, connect your phones, and enjoy the same beat together.
+      </p>
+    </section>
+
+    <section class="room-grid">
+      <article class="glass-card create-card">
+        <div class="card-top">
+          <div class="card-icon purple-icon">✦</div>
+          <span class="card-tag">HOST</span>
+        </div>
+        <h2>Start listening</h2>
+        <p>Create your own room and control the music for everyone.</p>
+        <button class="primary-btn" id="createBtn">
+          Create a room <span>↗</span>
+        </button>
+      </article>
+
+      <article class="glass-card join-card">
+        <div class="card-top">
+          <div class="card-icon blue-icon">⌁</div>
+          <span class="card-tag">GUEST</span>
+        </div>
+        <h2>Join your people</h2>
+        <p>Enter the room code shared by your host.</p>
+
+        <label for="nickname">YOUR NAME</label>
+        <input id="nickname" type="text" maxlength="20"
+          placeholder="Enter your name" autocomplete="nickname">
+
+        <label for="roomCode">ROOM CODE</label>
+        <input id="roomCode" type="text" maxlength="6"
+          placeholder="E.G. A4F29C" autocomplete="off">
+
+        <button class="secondary-btn" id="joinBtn">
+          Join room <span>→</span>
+        </button>
+      </article>
+    </section>
+
+    <section class="glass-card music-card">
+      <div class="section-heading">
+        <div>
+          <div class="section-kicker">YOUR LISTENING SPACE</div>
+          <h2 id="roomTitle">No room yet</h2>
+        </div>
+        <div class="room-badge" id="roomBadge">NOT CONNECTED</div>
+      </div>
+
+      <p class="status-text" id="status" role="status" aria-live="polite">
+        Create a room or join one to begin.
+      </p>
+
+      <div class="room-code-box" id="roomCodeBox" hidden>
+        <div>
+          <span class="muted-label">SHARE THIS ROOM CODE</span>
+          <strong id="roomCodeDisplay">------</strong>
+        </div>
+        <button id="copyCodeBtn" class="copy-btn" type="button">Copy code</button>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="section-heading song-heading">
+        <div>
+          <div class="section-kicker">NOW PLAYING</div>
+          <h2>Choose your vibe</h2>
+        </div>
+        <span class="youtube-label"><span>▶</span> YouTube</span>
+      </div>
+
+      <label for="youtubeUrl">YOUTUBE VIDEO LINK</label>
+      <div class="url-row">
+        <input id="youtubeUrl" type="url"
+          placeholder="Paste a YouTube song link here"
+          autocomplete="url">
+        <button id="loadSongBtn" class="primary-btn" type="button">
+          Load song
+        </button>
+      </div>
+
+      <p class="helper-text">
+        The song opens inside Beat Sync. Some YouTube videos may not allow embedding.
+      </p>
+
+      <div class="player-shell">
+        <div id="playerPlaceholder" class="player-placeholder">
+          <div class="music-symbol">♫</div>
+          <h3>Your next favourite song</h3>
+          <p>Load a YouTube link to get started.</p>
+        </div>
+        <div id="youtubePlayer" class="youtube-player"></div>
+      </div>
+
+      <div class="playback-bar">
+        <div class="playback-info">
+          <span class="playing-dot"></span>
+          <span id="playbackStatus">Waiting for a song</span>
+        </div>
+        <div class="controls">
+          <button id="playBtn" class="play-btn" type="button" disabled>
+            ▶ Play for everyone
+          </button>
+          <button id="pauseBtn" class="pause-btn" type="button" disabled>
+            Ⅱ Pause
+          </button>
+        </div>
+      </div>
+
+      <p class="helper-text">
+        Each phone may need a tap to enable playback. Keep this page open while listening.
+      </p>
+    </section>
+
+    <section class="glass-card members-card">
+      <div class="section-heading">
+        <div>
+          <div class="section-kicker">THE CREW</div>
+          <h2>Connected phones</h2>
+        </div>
+        <span class="member-count" id="memberCount">0 / 6</span>
+      </div>
+      <div id="membersList" class="members-list">
+        <p class="empty-members">Your room is waiting for its first listeners.</p>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <span class="footer-logo">♫ beatsync</span>
+      <span>Made for shared moments By GORAV .</span>
+    </footer>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
