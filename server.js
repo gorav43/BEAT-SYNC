@@ -1,4 +1,3 @@
-
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -7,17 +6,36 @@ const path = require("path");
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
+
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  },
+  pingInterval: 25000,
+  pingTimeout: 20000
+});
 
 const PORT = process.env.PORT || 3100;
 const rooms = new Map();
+
 const RECONNECT_GRACE_MS = 60_000;
+
+// All clients get this much preparation time before playback.
+const PLAY_START_DELAY_MS = 5000;
+
+// Small delay for seek operations while playing.
+const SEEK_START_DELAY_MS = 1500;
 
 app.use(express.static(path.join(__dirname, "public")));
 
 app.get("/", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
+
+// -----------------------------------------
+// ROOM HELPERS
+// -----------------------------------------
 
 function makeCode() {
   let code;
@@ -38,61 +56,72 @@ function getVideoId(input) {
       return url.pathname.split("/").filter(Boolean)[0] || null;
     }
 
-    if (
-      [
-        "youtube.com",
-        "www.youtube.com",
-        "m.youtube.com",
-        "music.youtube.com"
-      ].includes(host)
-    ) {
-      if (url.pathname === "/watch") {
-        return url.searchParams.get("v");
-      }
+    const validHosts = [
+      "youtube.com",
+      "www.youtube.com",
+      "m.youtube.com",
+      "music.youtube.com"
+    ];
 
-      const parts = url.pathname.split("/").filter(Boolean);
-
-      if (["embed", "shorts", "live"].includes(parts[0])) {
-        return parts[1] || null;
-      }
+    if (!validHosts.includes(host)) {
+      return null;
     }
-  } catch {}
+
+    if (url.pathname === "/watch") {
+      return url.searchParams.get("v");
+    }
+
+    const parts = url.pathname.split("/").filter(Boolean);
+
+    if (["embed", "shorts", "live"].includes(parts[0])) {
+      return parts[1] || null;
+    }
+  } catch {
+    return null;
+  }
 
   return null;
 }
 
 function getCurrentPosition(playback, now = Date.now()) {
-  if (!playback.playing || !playback.startedAt) {
-    return playback.position;
+  if (!playback || !playback.playing || !playback.startedAt) {
+    return Math.max(0, Number(playback?.position) || 0);
   }
 
-  return (
-    playback.position +
-    Math.max(0, now - playback.startedAt) / 1000
-  );
+  const elapsed = Math.max(0, now - playback.startedAt) / 1000;
+
+  return Math.max(0, (Number(playback.position) || 0) + elapsed);
+}
+
+function getRoomSnapshot(room, code) {
+  return {
+    code,
+    hostId: room.hostId,
+
+    members: [...room.members].map((id) => ({
+      id,
+      isHost: id === room.hostId
+    })),
+
+    track: room.track,
+
+    // Keep the original server timestamp.
+    // Clients calculate the current position using synchronized server time.
+    playback: {
+      playing: room.playback.playing,
+      position: room.playback.position,
+      startedAt: room.playback.startedAt
+    },
+
+    serverTime: Date.now()
+  };
 }
 
 function sendRoomState(code) {
   const room = rooms.get(code);
   if (!room) return;
 
-  const playback = { ...room.playback };
-
-  if (playback.playing) {
-    playback.position = getCurrentPosition(playback);
-    playback.startedAt = Date.now() + 1200;
-  }
-
-  io.to(code).emit("room-state", {
-    code,
-    hostId: room.hostId,
-    members: [...room.members].map((id) => ({
-      id,
-      isHost: id === room.hostId
-    })),
-    track: room.track,
-    playback
-  });
+  io.to(code).emit("room-state", getRoomSnapshot(room, code));
 }
 
 function closeRoom(code) {
@@ -110,6 +139,7 @@ function closeRoom(code) {
 
     if (memberSocket) {
       memberSocket.leave(code);
+
       if (memberSocket.data.roomCode === code) {
         delete memberSocket.data.roomCode;
       }
@@ -169,7 +199,33 @@ function joinSocketToRoom(socket, code, room) {
   socket.data.roomCode = code;
 }
 
+function sendCallback(callback, data) {
+  if (typeof callback === "function") {
+    callback(data);
+  }
+}
+
+// -----------------------------------------
+// SOCKET CONNECTION
+// -----------------------------------------
+
 io.on("connection", (socket) => {
+  console.log("Connected:", socket.id);
+
+  // ---------------------------------------
+  // SERVER CLOCK SYNCHRONIZATION
+  // ---------------------------------------
+
+  socket.on("clock-sync", (callback) => {
+    sendCallback(callback, {
+      serverTime: Date.now()
+    });
+  });
+
+  // ---------------------------------------
+  // CREATE ROOM
+  // ---------------------------------------
+
   socket.on("create-room", (callback) => {
     leaveCurrentRoom(socket);
 
@@ -179,25 +235,38 @@ io.on("connection", (socket) => {
     rooms.set(code, {
       hostId: socket.id,
       hostKey,
+
       members: new Set(),
+
       track: null,
+
       playback: {
         playing: false,
         position: 0,
         startedAt: null
       },
+
       reconnectTimer: null
     });
 
     const room = rooms.get(code);
+
     joinSocketToRoom(socket, code, room);
 
-    if (typeof callback === "function") {
-      callback({ ok: true, code, hostKey });
-    }
+    sendCallback(callback, {
+      ok: true,
+      code,
+      hostKey
+    });
 
     sendRoomState(code);
+
+    console.log("Room created:", code);
   });
+
+  // ---------------------------------------
+  // JOIN ROOM
+  // ---------------------------------------
 
   socket.on("join-room", (input, callback) => {
     const rawCode =
@@ -207,12 +276,10 @@ io.on("connection", (socket) => {
     const room = rooms.get(code);
 
     if (!room) {
-      if (typeof callback === "function") {
-        callback({
-          ok: false,
-          error: "Room not found. Check the room code."
-        });
-      }
+      sendCallback(callback, {
+        ok: false,
+        error: "Room not found. Check the room code."
+      });
       return;
     }
 
@@ -220,12 +287,10 @@ io.on("connection", (socket) => {
       !room.members.has(socket.id) &&
       room.members.size >= 6
     ) {
-      if (typeof callback === "function") {
-        callback({
-          ok: false,
-          error: "Room is full. Maximum 6 phones."
-        });
-      }
+      sendCallback(callback, {
+        ok: false,
+        error: "Room is full. Maximum 6 phones."
+      });
       return;
     }
 
@@ -235,25 +300,31 @@ io.on("connection", (socket) => {
 
     joinSocketToRoom(socket, code, room);
 
-    if (typeof callback === "function") {
-      callback({ ok: true, code });
-    }
+    sendCallback(callback, {
+      ok: true,
+      code
+    });
 
     sendRoomState(code);
+
+    console.log("Joined room:", code, socket.id);
   });
+
+  // ---------------------------------------
+  // REJOIN ROOM AFTER RECONNECT
+  // ---------------------------------------
 
   socket.on("rejoin-room", (data, callback) => {
     const code = String(data?.code || "").trim().toUpperCase();
     const hostKey = data?.hostKey;
+
     const room = rooms.get(code);
 
     if (!room) {
-      if (typeof callback === "function") {
-        callback({
-          ok: false,
-          error: "Room expired. Create a new room."
-        });
-      }
+      sendCallback(callback, {
+        ok: false,
+        error: "Room expired. Create a new room."
+      });
       return;
     }
 
@@ -264,14 +335,13 @@ io.on("connection", (socket) => {
 
     if (
       !isReturningHost &&
+      !room.members.has(socket.id) &&
       room.members.size >= 6
     ) {
-      if (typeof callback === "function") {
-        callback({
-          ok: false,
-          error: "Room is full. Maximum 6 phones."
-        });
-      }
+      sendCallback(callback, {
+        ok: false,
+        error: "Room is full. Maximum 6 phones."
+      });
       return;
     }
 
@@ -287,23 +357,30 @@ io.on("connection", (socket) => {
         room.reconnectTimer = null;
       }
 
-      // Replace the disconnected host's socket ID.
+      // Replace old host socket ID with the new connection.
       room.members.delete(room.hostId);
       room.hostId = socket.id;
     }
 
     joinSocketToRoom(socket, code, room);
 
-    if (typeof callback === "function") {
-      callback({
-        ok: true,
-        code,
-        isHost: isReturningHost
-      });
-    }
+    sendCallback(callback, {
+      ok: true,
+      code,
+      isHost: isReturningHost
+    });
 
     sendRoomState(code);
+
+    console.log(
+      isReturningHost ? "Host reconnected:" : "Member reconnected:",
+      code
+    );
   });
+
+  // ---------------------------------------
+  // SET YOUTUBE TRACK
+  // ---------------------------------------
 
   socket.on("set-youtube-track", (data, callback) => {
     const code = String(
@@ -317,24 +394,20 @@ io.on("connection", (socket) => {
       room.hostId !== socket.id ||
       room.hostKey !== data?.hostKey
     ) {
-      if (typeof callback === "function") {
-        callback({
-          ok: false,
-          error: "Host verification failed. Create or rejoin your room."
-        });
-      }
+      sendCallback(callback, {
+        ok: false,
+        error: "Host verification failed. Create or rejoin your room."
+      });
       return;
     }
 
     const videoId = getVideoId(String(data?.url || ""));
 
     if (!videoId || !/^[\w-]{11}$/.test(videoId)) {
-      if (typeof callback === "function") {
-        callback({
-          ok: false,
-          error: "Please enter a valid YouTube video link."
-        });
-      }
+      sendCallback(callback, {
+        ok: false,
+        error: "Please enter a valid YouTube video link."
+      });
       return;
     }
 
@@ -355,15 +428,23 @@ io.on("connection", (socket) => {
       videoId,
       position: 0,
       playing: false,
-      startedAt: null
+      startedAt: null,
+      serverTime: Date.now()
     });
 
     sendRoomState(code);
 
-    if (typeof callback === "function") {
-      callback({ ok: true, track: room.track });
-    }
+    sendCallback(callback, {
+      ok: true,
+      track: room.track
+    });
+
+    console.log("Track loaded:", videoId, "Room:", code);
   });
+
+  // ---------------------------------------
+  // PLAY / PAUSE / SEEK
+  // ---------------------------------------
 
   socket.on("playback-command", (command, callback) => {
     const code = String(
@@ -377,22 +458,18 @@ io.on("connection", (socket) => {
       room.hostId !== socket.id ||
       room.hostKey !== command?.hostKey
     ) {
-      if (typeof callback === "function") {
-        callback({
-          ok: false,
-          error: "Host verification failed. Rejoin the room."
-        });
-      }
+      sendCallback(callback, {
+        ok: false,
+        error: "Host verification failed. Rejoin the room."
+      });
       return;
     }
 
     if (!room.track) {
-      if (typeof callback === "function") {
-        callback({
-          ok: false,
-          error: "Choose a YouTube song first."
-        });
-      }
+      sendCallback(callback, {
+        ok: false,
+        error: "Choose a YouTube song first."
+      });
       return;
     }
 
@@ -401,30 +478,40 @@ io.on("connection", (socket) => {
     const current = room.playback;
 
     if (action === "play") {
+      const position = Math.max(
+        0,
+        Number(command.position) || 0
+      );
+
       room.playback = {
         playing: true,
-        position: Math.max(0, Number(command.position) || 0),
-        startedAt: now + 1500
+        position,
+        startedAt: now + PLAY_START_DELAY_MS
       };
     } else if (action === "pause") {
       room.playback = {
         playing: false,
-        position: Math.max(0, getCurrentPosition(current, now)),
+        position: getCurrentPosition(current, now),
         startedAt: null
       };
     } else if (action === "seek") {
+      const position = Math.max(
+        0,
+        Number(command.position) || 0
+      );
+
       room.playback = {
         playing: current.playing,
-        position: Math.max(0, Number(command.position) || 0),
-        startedAt: current.playing ? now + 1500 : null
+        position,
+        startedAt: current.playing
+          ? now + SEEK_START_DELAY_MS
+          : null
       };
     } else {
-      if (typeof callback === "function") {
-        callback({
-          ok: false,
-          error: "Unknown playback command."
-        });
-      }
+      sendCallback(callback, {
+        ok: false,
+        error: "Unknown playback command."
+      });
       return;
     }
 
@@ -432,19 +519,41 @@ io.on("connection", (socket) => {
       action,
       position: room.playback.position,
       playing: room.playback.playing,
+      startedAt: room.playback.startedAt,
+      serverTime: Date.now()
+    });
+
+    sendCallback(callback, {
+      ok: true,
       startedAt: room.playback.startedAt
     });
 
-    if (typeof callback === "function") {
-      callback({ ok: true });
-    }
+    console.log(
+      "Playback command:",
+      action,
+      "Room:",
+      code
+    );
   });
 
+  // ---------------------------------------
+  // DISCONNECT
+  // ---------------------------------------
+
   socket.on("disconnect", () => {
+    console.log("Disconnected:", socket.id);
+
     const code = socket.data.roomCode;
-    if (code) removeSocketFromRoom(socket, code);
+
+    if (code) {
+      removeSocketFromRoom(socket, code);
+    }
   });
 });
+
+// -----------------------------------------
+// START SERVER
+// -----------------------------------------
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Beat Sync running on port ${PORT}`);
