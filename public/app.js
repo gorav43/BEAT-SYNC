@@ -1,5 +1,5 @@
-
 const socket = io();
+
 const $ = (id) => document.getElementById(id);
 
 const createBtn = $("createBtn");
@@ -24,14 +24,20 @@ const playbackStatus = $("playbackStatus");
 const connectionStatus = $("connectionStatus");
 const toast = $("toast");
 
+// -------------------------------------
+// GLOBAL VARIABLES
+// -------------------------------------
+
 let mySocketId = null;
 let currentRoom = null;
 let hostKey = null;
 let currentTrack = null;
+
 let player = null;
 let playerReady = false;
 let pendingPlayback = null;
 let isHost = false;
+
 let toastTimeout = null;
 let lastCommandAt = 0;
 let playbackTimer = null;
@@ -39,621 +45,1001 @@ let playerGeneration = 0;
 let lastPlaybackSignature = "";
 let reconnectAttempted = false;
 
+// Server clock synchronization
+let serverClockOffset = 0;
+let hasServerClockOffset = false;
+let clockSyncTimer = null;
+let clockSyncInFlight = false;
+
+const CLOCK_SYNC_INTERVAL = 10000;
+
+// -------------------------------------
+// TOAST
+// -------------------------------------
+
 function showToast(message) {
-  toast.textContent = message;
-  toast.classList.add("show");
-  clearTimeout(toastTimeout);
-  toastTimeout = setTimeout(
-    () => toast.classList.remove("show"),
-    3000
-  );
+    toast.textContent = message;
+    toast.classList.add("show");
+
+    clearTimeout(toastTimeout);
+
+    toastTimeout = setTimeout(() => {
+        toast.classList.remove("show");
+    }, 3000);
 }
 
 function setStatus(message) {
-  statusText.textContent = message;
+    statusText.textContent = message;
 }
 
+// -------------------------------------
+// CONTROLS
+// -------------------------------------
+
 function updateControls() {
-  const hasRoom = Boolean(currentRoom);
-  const hasTrack = Boolean(currentTrack);
+    const hasRoom = Boolean(currentRoom);
+    const hasTrack = Boolean(currentTrack);
 
-  loadSongBtn.disabled = !isHost || !hasRoom;
-  youtubeUrl.disabled = !isHost || !hasRoom;
-  playBtn.disabled = !isHost || !hasTrack || !playerReady;
-  pauseBtn.disabled = !isHost || !hasTrack || !playerReady;
+    loadSongBtn.disabled = !isHost || !hasRoom;
+    youtubeUrl.disabled = !isHost || !hasRoom;
 
-  roomBadge.textContent = !hasRoom
-    ? "NOT CONNECTED"
-    : isHost
-      ? "HOST ROOM"
-      : "GUEST ROOM";
+    playBtn.disabled = !isHost || !hasTrack || !playerReady;
+    pauseBtn.disabled = !isHost || !hasTrack || !playerReady;
+
+    roomBadge.textContent = !hasRoom
+        ? "NOT CONNECTED"
+        : isHost
+            ? "HOST ROOM"
+            : "GUEST ROOM";
 }
 
 function setConnected(connected) {
-  connectionStatus.textContent = connected
-    ? "Connected"
-    : "Reconnecting";
+    connectionStatus.textContent = connected
+        ? "Connected"
+        : "Reconnecting";
 
-  const dot = document.querySelector(".live-dot");
+    const dot = document.querySelector(".live-dot");
 
-  if (dot) {
-    dot.style.background = connected ? "#27834b" : "#d99b28";
-  }
+    if (dot) {
+        dot.style.background = connected
+            ? "#27834b"
+            : "#d99b28";
+    }
 }
 
-function getDisplayName(member, index) {
-  if (member.id === mySocketId) {
-    return nicknameInput.value.trim() ||
-      (member.isHost ? "You (Host)" : "You");
-  }
+// -------------------------------------
+// MEMBERS
+// -------------------------------------
 
-  return member.isHost ? "Room Host" : `Listener ${index + 1}`;
+function getDisplayName(member, index) {
+    if (member.id === mySocketId) {
+        return nicknameInput.value.trim() ||
+            (member.isHost ? "You (Host)" : "You");
+    }
+
+    return member.isHost
+        ? "Room Host"
+        : `Listener ${index + 1}`;
 }
 
 function renderMembers(members) {
-  memberCount.textContent = `${members.length} / 6`;
+    memberCount.textContent = `${members.length} / 6`;
 
-  if (!members.length) {
-    membersText.innerHTML =
-      '<p class="empty-members">No listeners connected yet.</p>';
-    return;
-  }
+    if (!members.length) {
+        membersText.innerHTML =
+            '<p class="empty-members">No listeners connected yet.</p>';
+        return;
+    }
 
-  membersText.replaceChildren();
+    membersText.replaceChildren();
 
-  members.forEach((member, index) => {
-    const displayName = getDisplayName(member, index);
+    members.forEach((member, index) => {
+        const displayName = getDisplayName(member, index);
 
-    const row = document.createElement("div");
-    row.className = "member-row";
+        const row = document.createElement("div");
+        row.className = "member-row";
 
-    const avatar = document.createElement("div");
-    avatar.className = "member-avatar";
-    avatar.textContent = displayName.charAt(0).toUpperCase();
+        const avatar = document.createElement("div");
+        avatar.className = "member-avatar";
+        avatar.textContent = displayName.charAt(0).toUpperCase();
 
-    const details = document.createElement("div");
-    details.className = "member-details";
+        const details = document.createElement("div");
+        details.className = "member-details";
 
-    const name = document.createElement("div");
-    name.className = "member-name";
-    name.textContent = displayName;
+        const name = document.createElement("div");
+        name.className = "member-name";
+        name.textContent = displayName;
 
-    const role = document.createElement("div");
-    role.className = "member-role";
-    role.textContent = member.isHost
-      ? "Room host"
-      : "Connected listener";
+        const role = document.createElement("div");
+        role.className = "member-role";
+        role.textContent = member.isHost
+            ? "Room host"
+            : "Connected listener";
 
-    const online = document.createElement("span");
-    online.className = "member-online";
-    online.textContent = "Online";
+        const online = document.createElement("span");
+        online.className = "member-online";
+        online.textContent = "Online";
 
-    details.append(name, role);
-    row.append(avatar, details, online);
-    membersText.append(row);
-  });
+        details.append(name, role);
+        row.append(avatar, details, online);
+
+        membersText.append(row);
+    });
 }
+
+// -------------------------------------
+// SERVER CLOCK SYNCHRONIZATION
+// -------------------------------------
+
+function getServerNow() {
+    return Date.now() + serverClockOffset;
+}
+
+function syncServerClock() {
+    if (!socket.connected || clockSyncInFlight) {
+        return;
+    }
+
+    clockSyncInFlight = true;
+
+    const sentAt = Date.now();
+
+    socket.emit("clock-sync", (response) => {
+        const receivedAt = Date.now();
+
+        clockSyncInFlight = false;
+
+        if (
+            !response ||
+            !Number.isFinite(Number(response.serverTime))
+        ) {
+            return;
+        }
+
+        const midpoint = (sentAt + receivedAt) / 2;
+
+        const measuredOffset =
+            Number(response.serverTime) - midpoint;
+
+        if (!hasServerClockOffset) {
+            serverClockOffset = measuredOffset;
+            hasServerClockOffset = true;
+        } else {
+            // Smooth clock corrections.
+            serverClockOffset =
+                serverClockOffset * 0.8 +
+                measuredOffset * 0.2;
+        }
+    });
+}
+
+function startClockSync() {
+    stopClockSync();
+
+    syncServerClock();
+
+    clockSyncTimer = setInterval(() => {
+        syncServerClock();
+    }, CLOCK_SYNC_INTERVAL);
+}
+
+function stopClockSync() {
+    if (clockSyncTimer) {
+        clearInterval(clockSyncTimer);
+    }
+
+    clockSyncTimer = null;
+    clockSyncInFlight = false;
+}
+
+// -------------------------------------
+// PLAYER TIMER
+// -------------------------------------
 
 function clearPlaybackTimer() {
-  if (playbackTimer) clearTimeout(playbackTimer);
-  playbackTimer = null;
+    if (playbackTimer) {
+        clearTimeout(playbackTimer);
+    }
+
+    playbackTimer = null;
 }
+
+// -------------------------------------
+// RESET PLAYER
+// -------------------------------------
 
 function resetPlayer() {
-  playerGeneration++;
-  clearPlaybackTimer();
+    playerGeneration++;
 
-  const oldPlayer = player;
-  player = null;
-  playerReady = false;
-  pendingPlayback = null;
+    clearPlaybackTimer();
 
-  if (oldPlayer && typeof oldPlayer.destroy === "function") {
-    try {
-      oldPlayer.destroy();
-    } catch {}
-  }
+    const oldPlayer = player;
 
-  playerContainer.replaceChildren();
-  playerPlaceholder.hidden = false;
-  playbackStatus.textContent = "Waiting for a song";
+    player = null;
+    playerReady = false;
+    pendingPlayback = null;
 
-  updateControls();
+    if (oldPlayer && typeof oldPlayer.destroy === "function") {
+        try {
+            oldPlayer.destroy();
+        } catch {}
+    }
+
+    playerContainer.replaceChildren();
+
+    playerPlaceholder.hidden = false;
+
+    playbackStatus.textContent = "Waiting for a song";
+
+    updateControls();
 }
 
+// -------------------------------------
+// YOUTUBE API
+// -------------------------------------
+
 function loadYouTubeAPI() {
-  if (window.YT && window.YT.Player) {
-    if (currentTrack && (!player || !playerReady)) {
-      createPlayer(currentTrack.videoId);
+    if (window.YT && window.YT.Player) {
+        if (currentTrack && (!player || !playerReady)) {
+            createPlayer(currentTrack.videoId);
+        }
+
+        return;
     }
-    return;
-  }
 
-  if (document.getElementById("youtube-iframe-api")) return;
+    if (document.getElementById("youtube-iframe-api")) {
+        return;
+    }
 
-  const script = document.createElement("script");
-  script.id = "youtube-iframe-api";
-  script.src = "https://www.youtube.com/iframe_api";
-  script.onerror = () => {
-    showToast("YouTube player could not load. Check your internet.");
-  };
+    const script = document.createElement("script");
 
-  document.head.appendChild(script);
+    script.id = "youtube-iframe-api";
+    script.src = "https://www.youtube.com/iframe_api";
+
+    script.onerror = () => {
+        showToast(
+            "YouTube player could not load. Check your internet."
+        );
+    };
+
+    document.head.appendChild(script);
 }
 
 window.onYouTubeIframeAPIReady = () => {
-  if (currentTrack) createPlayer(currentTrack.videoId);
+    if (currentTrack) {
+        createPlayer(currentTrack.videoId);
+    }
 };
 
+// -------------------------------------
+// CREATE YOUTUBE PLAYER
+// -------------------------------------
+
 function createPlayer(videoId) {
-  if (!window.YT || !window.YT.Player) {
-    loadYouTubeAPI();
-    return;
-  }
-
-  resetPlayer();
-
-  const generation = playerGeneration;
-  const element = document.createElement("div");
-  element.id = "yt-player-frame";
-  playerContainer.appendChild(element);
-
-  player = new YT.Player("yt-player-frame", {
-    width: "100%",
-    height: "100%",
-    videoId,
-    playerVars: {
-      playsinline: 1,
-      controls: 0,
-      disablekb: 1,
-      rel: 0,
-      origin: window.location.origin
-    },
-    events: {
-      onReady: () => {
-        if (generation !== playerGeneration) return;
-
-        playerReady = true;
-        playerPlaceholder.hidden = true;
-        playbackStatus.textContent = "Song ready";
-        updateControls();
-
-        if (pendingPlayback) {
-          const command = pendingPlayback;
-          pendingPlayback = null;
-          applyPlayback(command);
-        }
-      },
-
-      onStateChange: (event) => {
-        if (generation !== playerGeneration) return;
-
-        if (event.data === YT.PlayerState.PLAYING) {
-          playbackStatus.textContent = "Playing";
-        } else if (event.data === YT.PlayerState.PAUSED) {
-          playbackStatus.textContent = "Paused";
-        } else if (event.data === YT.PlayerState.ENDED) {
-          playbackStatus.textContent = "Song ended";
-        }
-      },
-
-      onError: (event) => {
-        if (generation !== playerGeneration) return;
-
-        const errors = {
-          2: "Invalid YouTube video ID.",
-          5: "This video cannot play in the embedded player.",
-          100: "Video not found or unavailable.",
-          101: "The owner does not allow embedded playback.",
-          150: "The owner does not allow embedded playback."
-        };
-
-        showToast(
-          errors[event.data] || "YouTube could not play this video."
-        );
-
-        playbackStatus.textContent = "Video unavailable";
-      }
+    if (!window.YT || !window.YT.Player) {
+        loadYouTubeAPI();
+        return;
     }
-  });
+
+    resetPlayer();
+
+    const generation = playerGeneration;
+
+    const element = document.createElement("div");
+    element.id = "yt-player-frame";
+
+    playerContainer.appendChild(element);
+
+    player = new YT.Player("yt-player-frame", {
+        width: "100%",
+        height: "100%",
+        videoId,
+
+        playerVars: {
+            playsinline: 1,
+            controls: 0,
+            disablekb: 1,
+            rel: 0,
+            origin: window.location.origin
+        },
+
+        events: {
+
+            onReady: () => {
+                if (generation !== playerGeneration) return;
+
+                playerReady = true;
+
+                playerPlaceholder.hidden = true;
+
+                playbackStatus.textContent = "Song ready";
+
+                updateControls();
+
+                if (pendingPlayback) {
+                    const command = pendingPlayback;
+
+                    pendingPlayback = null;
+
+                    applyPlayback(command, true);
+                }
+            },
+
+            onStateChange: (event) => {
+                if (generation !== playerGeneration) return;
+
+                if (event.data === YT.PlayerState.PLAYING) {
+                    playbackStatus.textContent = "Playing";
+                }
+
+                else if (event.data === YT.PlayerState.PAUSED) {
+                    playbackStatus.textContent = "Paused";
+                }
+
+                else if (event.data === YT.PlayerState.ENDED) {
+                    playbackStatus.textContent = "Song ended";
+                }
+
+                else if (event.data === YT.PlayerState.BUFFERING) {
+                    playbackStatus.textContent = "Buffering";
+                }
+            },
+
+            onAutoplayBlocked: () => {
+                playbackStatus.textContent =
+                    "Tap player to enable playback";
+
+                showToast(
+                    "Browser blocked autoplay. Tap the player once."
+                );
+            },
+
+            onError: (event) => {
+                if (generation !== playerGeneration) return;
+
+                const errors = {
+                    2: "Invalid YouTube video ID.",
+                    5: "This video cannot play in embedded player.",
+                    100: "Video not found or unavailable.",
+                    101: "Embedding is disabled for this video.",
+                    150: "Embedding is disabled for this video."
+                };
+
+                showToast(
+                    errors[event.data] ||
+                    "YouTube could not play this video."
+                );
+
+                playbackStatus.textContent = "Video unavailable";
+            }
+        }
+    });
 }
+
+// -------------------------------------
+// EXPECTED PLAYBACK POSITION
+// -------------------------------------
 
 function getExpectedPosition(command) {
-  let position = Math.max(0, Number(command.position) || 0);
+    let position = Math.max(
+        0,
+        Number(command.position) || 0
+    );
 
-  if (command.playing && command.startedAt) {
-    position += Math.max(
-      0,
-      Date.now() - Number(command.startedAt)
-    ) / 1000;
-  }
-
-  return position;
-}
-
-function applyPlayback(command) {
-  if (!command) return;
-
-  const signature =
-    `${command.action}|${command.position}|${command.playing}|${command.startedAt}`;
-
-  if (
-    signature === lastPlaybackSignature &&
-    command.action !== "load"
-  ) {
-    return;
-  }
-
-  lastPlaybackSignature = signature;
-
-  if (!playerReady || !player) {
-    pendingPlayback = command;
-    return;
-  }
-
-  if (command.action === "load") return;
-
-  clearPlaybackTimer();
-
-  const position = getExpectedPosition(command);
-
-  try {
-    if (command.action === "pause" || command.playing === false) {
-      player.pauseVideo();
-      player.seekTo(position, true);
-      playbackStatus.textContent = "Paused";
-      return;
-    }
-
-    if (
-      command.action === "play" ||
-      command.playing === true ||
-      command.action === "seek"
-    ) {
-      const startAt = Number(command.startedAt) || 0;
-
-      if (startAt > Date.now()) {
-        player.pauseVideo();
-        player.seekTo(
-          Math.max(0, Number(command.position) || 0),
-          true
+    if (command.playing && command.startedAt) {
+        const elapsed = Math.max(
+            0,
+            getServerNow() - Number(command.startedAt)
         );
 
-        playbackTimer = setTimeout(() => {
-          playbackTimer = null;
-          if (!playerReady || !player) return;
-
-          player.seekTo(getExpectedPosition(command), true);
-          player.playVideo();
-        }, startAt - Date.now());
-      } else {
-        player.seekTo(position, true);
-        player.playVideo();
-      }
+        position += elapsed / 1000;
     }
-  } catch {
-    showToast(
-      "Playback could not start. Tap the video once, then press Play."
-    );
-  }
+
+    return position;
 }
+
+// -------------------------------------
+// APPLY PLAYBACK
+// -------------------------------------
+
+function applyPlayback(command, force = false) {
+    if (!command) return;
+
+    const signature =
+        `${command.action}|${command.position}|${command.playing}|${command.startedAt}`;
+
+    if (
+        !force &&
+        signature === lastPlaybackSignature &&
+        command.action !== "load"
+    ) {
+        return;
+    }
+
+    lastPlaybackSignature = signature;
+
+    if (!playerReady || !player) {
+        pendingPlayback = command;
+        return;
+    }
+
+    if (command.action === "load") {
+        return;
+    }
+
+    clearPlaybackTimer();
+
+    const position = getExpectedPosition(command);
+
+    try {
+
+        // PAUSE
+        if (
+            command.action === "pause" ||
+            command.playing === false
+        ) {
+            player.pauseVideo();
+
+            player.seekTo(position, true);
+
+            playbackStatus.textContent = "Paused";
+
+            return;
+        }
+
+        // PLAY / SEEK
+        if (
+            command.action === "play" ||
+            command.playing === true ||
+            command.action === "seek"
+        ) {
+            const startAt =
+                Number(command.startedAt) || 0;
+
+            const remaining =
+                startAt - getServerNow();
+
+            // Prepare video before common start time.
+            player.pauseVideo();
+
+            player.seekTo(
+                Math.max(
+                    0,
+                    Number(command.position) || 0
+                ),
+                true
+            );
+
+            if (remaining > 80) {
+
+                playbackStatus.textContent =
+                    "Starting together…";
+
+                playbackTimer = setTimeout(() => {
+                    playbackTimer = null;
+
+                    if (!playerReady || !player) {
+                        return;
+                    }
+
+                    const targetPosition =
+                        getExpectedPosition(command);
+
+                    try {
+                        player.seekTo(targetPosition, true);
+
+                        player.playVideo();
+
+                        playbackStatus.textContent = "Starting…";
+                    } catch {
+                        showToast(
+                            "Playback could not start. Try again."
+                        );
+                    }
+
+                }, Math.max(0, remaining));
+
+            } else {
+
+                player.seekTo(position, true);
+
+                player.playVideo();
+            }
+        }
+
+    } catch {
+        showToast(
+            "Playback failed. Tap the video once and try again."
+        );
+    }
+}
+
+// -------------------------------------
+// CREATE ROOM
+// -------------------------------------
 
 function createRoom() {
-  socket.emit("create-room", (response) => {
-    if (!response?.ok) {
-      showToast("Could not create room. Try again.");
-      return;
-    }
+    socket.emit("create-room", (response) => {
 
-    currentRoom = response.code;
-    hostKey = response.hostKey;
-    isHost = true;
-    currentTrack = null;
-    lastPlaybackSignature = "";
+        if (!response?.ok) {
+            showToast("Could not create room.");
+            return;
+        }
 
-    // Save the room details so the host can reconnect.
-    localStorage.setItem("beatSyncRoom", currentRoom);
-    localStorage.setItem("beatSyncHostKey", hostKey);
+        currentRoom = response.code;
+        hostKey = response.hostKey;
 
-    roomTitle.textContent = "Your listening room";
-    roomCodeDisplay.textContent = currentRoom;
-    roomCodeBox.hidden = false;
+        isHost = true;
+        currentTrack = null;
 
-    setStatus("Room created! Share the code with your friends.");
-    showToast(`Room ${currentRoom} created`);
+        lastPlaybackSignature = "";
 
-    updateControls();
-  });
-}
+        localStorage.setItem(
+            "beatSyncRoom",
+            currentRoom
+        );
 
-function joinRoom() {
-  const code = roomCodeInput.value.trim().toUpperCase();
+        localStorage.setItem(
+            "beatSyncHostKey",
+            hostKey
+        );
 
-  if (code.length !== 6) {
-    showToast("Enter the 6-character room code.");
-    return;
-  }
+        roomTitle.textContent = "Your listening room";
 
-  socket.emit("join-room", code, (response) => {
-    if (!response?.ok) {
-      showToast(response?.error || "Could not join room.");
-      return;
-    }
+        roomCodeDisplay.textContent = currentRoom;
 
-    currentRoom = response.code;
-    hostKey = null;
-    isHost = false;
-    currentTrack = null;
-    lastPlaybackSignature = "";
+        roomCodeBox.hidden = false;
 
-    localStorage.setItem("beatSyncRoom", currentRoom);
-    localStorage.removeItem("beatSyncHostKey");
+        setStatus(
+            "Room created! Share the code with your friends."
+        );
 
-    roomTitle.textContent = "Joined listening room";
-    roomCodeDisplay.textContent = currentRoom;
-    roomCodeBox.hidden = false;
-
-    setStatus("Connected! Wait for the host to choose a song.");
-    showToast("Successfully joined room");
-
-    updateControls();
-  });
-}
-
-function loadSong() {
-  if (!isHost || !currentRoom || !hostKey) {
-    showToast("Create or reconnect to your host room first.");
-    return;
-  }
-
-  const url = youtubeUrl.value.trim();
-
-  if (!url) {
-    showToast("Paste a YouTube link first.");
-    return;
-  }
-
-  socket.emit(
-    "set-youtube-track",
-    {
-      url,
-      code: currentRoom,
-      hostKey
-    },
-    (response) => {
-      if (!response?.ok) {
-        showToast(response?.error || "Could not load the song.");
-        return;
-      }
-
-      currentTrack = response.track;
-      pendingPlayback = null;
-      lastPlaybackSignature = "";
-
-      setStatus("Song loaded. Press Play for everyone.");
-      playbackStatus.textContent = "Loading YouTube video";
-
-      updateControls();
-    }
-  );
-}
-
-function sendPlayback(action) {
-  if (!isHost || !hostKey || !playerReady || !player) {
-    showToast("Wait for the YouTube player to finish loading.");
-    return;
-  }
-
-  const now = Date.now();
-
-  if (now - lastCommandAt < 350) return;
-  lastCommandAt = now;
-
-  let position = 0;
-
-  try {
-    position = player.getCurrentTime() || 0;
-  } catch {
-    showToast("Player is not ready yet.");
-    return;
-  }
-
-  socket.emit(
-    "playback-command",
-    {
-      action,
-      position,
-      code: currentRoom,
-      hostKey
-    },
-    (response) => {
-      if (!response?.ok) {
-        showToast(response?.error || "Playback command failed.");
-      }
-    }
-  );
-}
-
-function attemptRejoin() {
-  if (reconnectAttempted || !socket.connected) return;
-
-  const savedRoom = localStorage.getItem("beatSyncRoom");
-  const savedHostKey = localStorage.getItem("beatSyncHostKey");
-
-  if (!savedRoom) return;
-
-  reconnectAttempted = true;
-
-  socket.emit(
-    "rejoin-room",
-    {
-      code: savedRoom,
-      hostKey: savedHostKey || null
-    },
-    (response) => {
-      if (!response?.ok) {
-        currentRoom = null;
-        hostKey = null;
-        isHost = false;
-
-        localStorage.removeItem("beatSyncRoom");
-        localStorage.removeItem("beatSyncHostKey");
+        showToast(`Room ${currentRoom} created`);
 
         updateControls();
-        showToast(response?.error || "Could not reconnect. Create or join a room.");
-        return;
-      }
-
-      currentRoom = response.code;
-      isHost = Boolean(response.isHost);
-      hostKey = response.isHost ? savedHostKey : null;
-
-      if (!isHost) {
-        localStorage.removeItem("beatSyncHostKey");
-      }
-
-      roomCodeDisplay.textContent = currentRoom;
-      roomCodeBox.hidden = false;
-
-      roomTitle.textContent = isHost
-        ? "Your listening room"
-        : "Joined listening room";
-
-      setStatus(
-        isHost
-          ? "Host reconnected. Your room is ready."
-          : "Reconnected to the listening room."
-      );
-
-      updateControls();
-    }
-  );
+    });
 }
 
+// -------------------------------------
+// JOIN ROOM
+// -------------------------------------
+
+function joinRoom() {
+    const code = roomCodeInput.value
+        .trim()
+        .toUpperCase();
+
+    if (code.length !== 6) {
+        showToast("Enter the 6-character room code.");
+        return;
+    }
+
+    socket.emit("join-room", code, (response) => {
+
+        if (!response?.ok) {
+            showToast(
+                response?.error || "Could not join room."
+            );
+
+            return;
+        }
+
+        currentRoom = response.code;
+
+        hostKey = null;
+        isHost = false;
+        currentTrack = null;
+
+        lastPlaybackSignature = "";
+
+        localStorage.setItem(
+            "beatSyncRoom",
+            currentRoom
+        );
+
+        localStorage.removeItem("beatSyncHostKey");
+
+        roomTitle.textContent = "Joined listening room";
+
+        roomCodeDisplay.textContent = currentRoom;
+
+        roomCodeBox.hidden = false;
+
+        setStatus(
+            "Connected! Wait for the host to choose a song."
+        );
+
+        showToast("Successfully joined room");
+
+        updateControls();
+    });
+}
+
+// -------------------------------------
+// LOAD SONG
+// -------------------------------------
+
+function loadSong() {
+    if (!isHost || !currentRoom || !hostKey) {
+        showToast(
+            "Create or reconnect to your host room first."
+        );
+
+        return;
+    }
+
+    const url = youtubeUrl.value.trim();
+
+    if (!url) {
+        showToast("Paste a YouTube link first.");
+        return;
+    }
+
+    socket.emit(
+        "set-youtube-track",
+        {
+            url,
+            code: currentRoom,
+            hostKey
+        },
+
+        (response) => {
+
+            if (!response?.ok) {
+                showToast(
+                    response?.error || "Could not load the song."
+                );
+
+                return;
+            }
+
+            currentTrack = response.track;
+
+            pendingPlayback = null;
+            lastPlaybackSignature = "";
+
+            setStatus(
+                "Song loaded. Press Play for everyone."
+            );
+
+            playbackStatus.textContent =
+                "Loading YouTube video";
+
+            updateControls();
+        }
+    );
+}
+
+// -------------------------------------
+// SEND PLAYBACK COMMAND
+// -------------------------------------
+
+function sendPlayback(action) {
+
+    if (!isHost || !hostKey || !playerReady || !player) {
+        showToast(
+            "Wait for the YouTube player to finish loading."
+        );
+
+        return;
+    }
+
+    const now = Date.now();
+
+    if (now - lastCommandAt < 350) {
+        return;
+    }
+
+    lastCommandAt = now;
+
+    let position = 0;
+
+    try {
+        position = player.getCurrentTime() || 0;
+    } catch {
+        showToast("Player is not ready yet.");
+        return;
+    }
+
+    socket.emit(
+        "playback-command",
+        {
+            action,
+            position,
+            code: currentRoom,
+            hostKey
+        },
+
+        (response) => {
+
+            if (!response?.ok) {
+                showToast(
+                    response?.error ||
+                    "Playback command failed."
+                );
+            }
+        }
+    );
+}
+
+// -------------------------------------
+// RECONNECT
+// -------------------------------------
+
+function attemptRejoin() {
+
+    if (reconnectAttempted || !socket.connected) {
+        return;
+    }
+
+    const savedRoom =
+        localStorage.getItem("beatSyncRoom");
+
+    const savedHostKey =
+        localStorage.getItem("beatSyncHostKey");
+
+    if (!savedRoom) return;
+
+    reconnectAttempted = true;
+
+    socket.emit(
+        "rejoin-room",
+        {
+            code: savedRoom,
+            hostKey: savedHostKey || null
+        },
+
+        (response) => {
+
+            if (!response?.ok) {
+
+                currentRoom = null;
+                hostKey = null;
+                isHost = false;
+
+                localStorage.removeItem("beatSyncRoom");
+                localStorage.removeItem("beatSyncHostKey");
+
+                updateControls();
+
+                showToast(
+                    response?.error ||
+                    "Could not reconnect. Create or join a room."
+                );
+
+                return;
+            }
+
+            currentRoom = response.code;
+
+            isHost = Boolean(response.isHost);
+
+            hostKey = response.isHost
+                ? savedHostKey
+                : null;
+
+            if (!isHost) {
+                localStorage.removeItem("beatSyncHostKey");
+            }
+
+            roomCodeDisplay.textContent = currentRoom;
+
+            roomCodeBox.hidden = false;
+
+            roomTitle.textContent = isHost
+                ? "Your listening room"
+                : "Joined listening room";
+
+            setStatus(
+                isHost
+                    ? "Host reconnected. Your room is ready."
+                    : "Reconnected to the listening room."
+            );
+
+            updateControls();
+        }
+    );
+}
+
+// -------------------------------------
+// SOCKET CONNECT
+// -------------------------------------
+
 socket.on("connect", () => {
-  mySocketId = socket.id;
-  reconnectAttempted = false;
-  setConnected(true);
-  attemptRejoin();
+
+    mySocketId = socket.id;
+
+    reconnectAttempted = false;
+
+    setConnected(true);
+
+    startClockSync();
+
+    attemptRejoin();
 });
 
 socket.on("disconnect", () => {
-  setConnected(false);
+
+    setConnected(false);
+
+    stopClockSync();
 });
+
+socket.on("connect_error", () => {
+    setConnected(false);
+});
+
+// -------------------------------------
+// ROOM STATE
+// -------------------------------------
 
 socket.on("room-state", (state) => {
-  currentRoom = state.code;
-  isHost = state.hostId === socket.id;
 
-  roomTitle.textContent = isHost
-    ? "Your listening room"
-    : "Joined listening room";
+    currentRoom = state.code;
 
-  roomCodeDisplay.textContent = state.code;
-  roomCodeBox.hidden = false;
+    isHost = state.hostId === socket.id;
 
-  if (state.track?.type === "youtube") {
-    const changedVideo =
-      currentTrack?.videoId !== state.track.videoId;
+    roomTitle.textContent = isHost
+        ? "Your listening room"
+        : "Joined listening room";
 
-    currentTrack = state.track;
-    youtubeUrl.value =
-      state.track.url ||
-      `https://www.youtube.com/watch?v=${state.track.videoId}`;
+    roomCodeDisplay.textContent = state.code;
 
-    if (changedVideo) {
-      createPlayer(state.track.videoId);
+    roomCodeBox.hidden = false;
+
+    if (state.track?.type === "youtube") {
+
+        const changedVideo =
+            currentTrack?.videoId !== state.track.videoId;
+
+        currentTrack = state.track;
+
+        youtubeUrl.value =
+            state.track.url ||
+            `https://www.youtube.com/watch?v=${state.track.videoId}`;
+
+        if (changedVideo) {
+            createPlayer(state.track.videoId);
+        }
+
+    } else if (!state.track) {
+
+        currentTrack = null;
+
+        resetPlayer();
     }
-  } else if (!state.track) {
-    currentTrack = null;
-    resetPlayer();
-  }
 
-  renderMembers(state.members || []);
-  updateControls();
+    renderMembers(state.members || []);
 
-  setStatus(
-    isHost
-      ? "You're the host. Share the code and choose a YouTube song."
-      : "You're connected. The host controls the music."
-  );
+    updateControls();
 
-  if (state.playback && currentTrack) {
-    applyPlayback({
-      ...state.playback,
-      action: state.playback.playing ? "play" : "pause"
-    });
-  }
+    setStatus(
+        isHost
+            ? "You're the host. Share the code and choose a YouTube song."
+            : "You're connected. The host controls the music."
+    );
+
+    if (state.playback && currentTrack) {
+
+        applyPlayback(
+            {
+                ...state.playback,
+
+                action: state.playback.playing
+                    ? "play"
+                    : "pause"
+            },
+            true
+        );
+    }
 });
+
+// -------------------------------------
+// PLAYBACK UPDATE
+// -------------------------------------
 
 socket.on("playback-update", (command) => {
-  if (command.action === "load") {
-    currentTrack = {
-      type: "youtube",
-      videoId: command.videoId,
-      url: `https://www.youtube.com/watch?v=${command.videoId}`
-    };
 
-    pendingPlayback = null;
-    lastPlaybackSignature = "";
+    if (command.action === "load") {
 
-    createPlayer(command.videoId);
-    return;
-  }
+        currentTrack = {
+            type: "youtube",
+            videoId: command.videoId,
+            url: `https://www.youtube.com/watch?v=${command.videoId}`
+        };
 
-  applyPlayback(command);
+        pendingPlayback = null;
+
+        lastPlaybackSignature = "";
+
+        createPlayer(command.videoId);
+
+        return;
+    }
+
+    applyPlayback(command);
 });
+
+// -------------------------------------
+// ROOM CLOSED
+// -------------------------------------
 
 socket.on("room-closed", () => {
-  currentRoom = null;
-  hostKey = null;
-  currentTrack = null;
-  isHost = false;
-  reconnectAttempted = false;
-  lastPlaybackSignature = "";
 
-  localStorage.removeItem("beatSyncRoom");
-  localStorage.removeItem("beatSyncHostKey");
+    currentRoom = null;
+    hostKey = null;
+    currentTrack = null;
 
-  roomTitle.textContent = "No room yet";
-  roomCodeBox.hidden = true;
+    isHost = false;
+    reconnectAttempted = false;
 
-  renderMembers([]);
-  resetPlayer();
-  updateControls();
+    lastPlaybackSignature = "";
 
-  setStatus("The room has closed.");
-  showToast("Room closed");
+    localStorage.removeItem("beatSyncRoom");
+    localStorage.removeItem("beatSyncHostKey");
+
+    roomTitle.textContent = "No room yet";
+
+    roomCodeBox.hidden = true;
+
+    renderMembers([]);
+
+    resetPlayer();
+
+    updateControls();
+
+    setStatus("The room has closed.");
+
+    showToast("Room closed");
 });
 
+// -------------------------------------
+// BUTTON EVENTS
+// -------------------------------------
+
 createBtn.addEventListener("click", createRoom);
+
 joinBtn.addEventListener("click", joinRoom);
+
 loadSongBtn.addEventListener("click", loadSong);
 
 playBtn.addEventListener("click", () => {
-  sendPlayback("play");
+    sendPlayback("play");
 });
 
 pauseBtn.addEventListener("click", () => {
-  sendPlayback("pause");
+    sendPlayback("pause");
 });
 
 copyCodeBtn.addEventListener("click", async () => {
-  if (!currentRoom) return;
 
-  try {
-    await navigator.clipboard.writeText(currentRoom);
-    showToast("Room code copied!");
-  } catch {
-    showToast(`Room code: ${currentRoom}`);
-  }
+    if (!currentRoom) return;
+
+    try {
+        await navigator.clipboard.writeText(currentRoom);
+
+        showToast("Room code copied!");
+
+    } catch {
+        showToast(`Room code: ${currentRoom}`);
+    }
 });
 
 roomCodeInput.addEventListener("input", () => {
-  roomCodeInput.value = roomCodeInput.value
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, "");
+
+    roomCodeInput.value = roomCodeInput.value
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, "");
 });
 
+// -------------------------------------
+// INITIALIZE
+// -------------------------------------
+
 loadYouTubeAPI();
+
 updateControls();
+
+if (socket.connected) {
+    startClockSync();
+}
